@@ -3,15 +3,18 @@ import crossSpawn from 'cross-spawn';
 import { promises as fs } from 'fs';
 import path from 'path';
 import os from 'os';
+import { NodeSSH } from 'node-ssh';
 
 // Use cross-spawn on Windows for better command execution
 const spawnFunction = process.platform === 'win32' ? crossSpawn : spawn;
 
-let activeClaudeProcesses = new Map(); // Track active processes by session ID
+// Track active sessions (local or remote) by session ID
+// Map<sessionId, { type: 'local', process: ChildProcess } | { type: 'ssh', ssh: NodeSSH, channel: any }>
+let activeClaudeProcesses = new Map();
 
 async function spawnClaude(command, options = {}, ws) {
   return new Promise(async (resolve, reject) => {
-    const { sessionId, projectPath, cwd, resume, toolsSettings, permissionMode, images } = options;
+    const { sessionId, projectPath, cwd, resume, toolsSettings, permissionMode, images, ssh: sshConfig } = options;
     let capturedSessionId = sessionId; // Track session ID throughout the process
     let sessionCreatedSent = false; // Track if we've already sent session-created event
     
@@ -38,47 +41,57 @@ async function spawnClaude(command, options = {}, ws) {
     const workingDir = cwd || process.cwd();
     
     // Handle images by saving them to temporary files and passing paths to Claude
-    const tempImagePaths = [];
-    let tempDir = null;
+    const tempImagePaths = []; // paths used in command (local or remote)
+    let tempDir = null; // local temp dir
+    let remoteTempDir = null; // remote temp dir when using ssh
+    const localImagePaths = []; // used for uploading when using ssh
     if (images && images.length > 0) {
       try {
-        // Create temp directory in the project directory so Claude can access it
-        tempDir = path.join(workingDir, '.tmp', 'images', Date.now().toString());
+        const timestamp = Date.now().toString();
+        if (sshConfig) {
+          // When using SSH, create temp dir locally then upload to remote cwd
+          tempDir = path.join(os.tmpdir(), 'claude-ssh', timestamp);
+          remoteTempDir = path.posix.join(workingDir.replace(/\\/g, '/'), '.tmp', 'images', timestamp);
+        } else {
+          // Create temp directory in the project directory so Claude can access it
+          tempDir = path.join(workingDir, '.tmp', 'images', timestamp);
+        }
         await fs.mkdir(tempDir, { recursive: true });
-        
+
         // Save each image to a temp file
         for (const [index, image] of images.entries()) {
-          // Extract base64 data and mime type
           const matches = image.data.match(/^data:([^;]+);base64,(.+)$/);
           if (!matches) {
             console.error('Invalid image data format');
             continue;
           }
-          
+
           const [, mimeType, base64Data] = matches;
           const extension = mimeType.split('/')[1] || 'png';
           const filename = `image_${index}.${extension}`;
-          const filepath = path.join(tempDir, filename);
-          
-          // Write base64 data to file
-          await fs.writeFile(filepath, Buffer.from(base64Data, 'base64'));
-          tempImagePaths.push(filepath);
+          const localPath = path.join(tempDir, filename);
+          await fs.writeFile(localPath, Buffer.from(base64Data, 'base64'));
+
+          if (sshConfig) {
+            const remotePath = path.posix.join(remoteTempDir, filename);
+            localImagePaths.push({ local: localPath, remote: remotePath });
+            tempImagePaths.push(remotePath);
+          } else {
+            tempImagePaths.push(localPath);
+          }
         }
-        
-        // Include the full image paths in the prompt for Claude to reference
-        // Only modify the command if we actually have images and a command
+
         if (tempImagePaths.length > 0 && command && command.trim()) {
           const imageNote = `\n\n[Images provided at the following paths:]\n${tempImagePaths.map((p, i) => `${i + 1}. ${p}`).join('\n')}`;
           const modifiedCommand = command + imageNote;
-          
+
           // Update the command in args - now that --print and command are separate
           const printIndex = args.indexOf('--print');
           if (printIndex !== -1 && printIndex + 1 < args.length && args[printIndex + 1] === command) {
             args[printIndex + 1] = modifiedCommand;
           }
         }
-        
-        
+
       } catch (error) {
         console.error('Error processing images for Claude:', error);
       }
@@ -234,151 +247,174 @@ async function spawnClaude(command, options = {}, ws) {
     console.log('Session info - Input sessionId:', sessionId, 'Resume:', resume);
     console.log('🔍 Full command args:', JSON.stringify(args, null, 2));
     console.log('🔍 Final Claude command will be: claude ' + args.join(' '));
-    
-    const claudeProcess = spawnFunction('claude', args, {
-      cwd: workingDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env } // Inherit all environment variables
-    });
-    
-    // Attach temp file info to process for cleanup later
-    claudeProcess.tempImagePaths = tempImagePaths;
-    claudeProcess.tempDir = tempDir;
-    
-    // Store process reference for potential abort
     const processKey = capturedSessionId || sessionId || Date.now().toString();
-    activeClaudeProcesses.set(processKey, claudeProcess);
-    
-    // Handle stdout (streaming JSON responses)
-    claudeProcess.stdout.on('data', (data) => {
+
+    const handleStdout = (data) => {
       const rawOutput = data.toString();
       console.log('📤 Claude CLI stdout:', rawOutput);
-      
       const lines = rawOutput.split('\n').filter(line => line.trim());
-      
       for (const line of lines) {
         try {
           const response = JSON.parse(line);
           console.log('📄 Parsed JSON response:', response);
-          
-          // Capture session ID if it's in the response
           if (response.session_id && !capturedSessionId) {
             capturedSessionId = response.session_id;
             console.log('📝 Captured session ID:', capturedSessionId);
-            
-            // Update process key with captured session ID
-            if (processKey !== capturedSessionId) {
+            const existing = activeClaudeProcesses.get(processKey);
+            if (existing && processKey !== capturedSessionId) {
               activeClaudeProcesses.delete(processKey);
-              activeClaudeProcesses.set(capturedSessionId, claudeProcess);
+              activeClaudeProcesses.set(capturedSessionId, existing);
             }
-            
-            // Send session-created event only once for new sessions
             if (!sessionId && !sessionCreatedSent) {
               sessionCreatedSent = true;
-              ws.send(JSON.stringify({
-                type: 'session-created',
-                sessionId: capturedSessionId
-              }));
+              ws.send(JSON.stringify({ type: 'session-created', sessionId: capturedSessionId }));
             }
           }
-          
-          // Send parsed response to WebSocket
-          ws.send(JSON.stringify({
-            type: 'claude-response',
-            data: response
-          }));
+          ws.send(JSON.stringify({ type: 'claude-response', data: response }));
         } catch (parseError) {
           console.log('📄 Non-JSON response:', line);
-          // If not JSON, send as raw text
-          ws.send(JSON.stringify({
-            type: 'claude-output',
-            data: line
-          }));
+          ws.send(JSON.stringify({ type: 'claude-output', data: line }));
         }
       }
-    });
-    
-    // Handle stderr
-    claudeProcess.stderr.on('data', (data) => {
+    };
+
+    const handleStderr = (data) => {
       console.error('Claude CLI stderr:', data.toString());
-      ws.send(JSON.stringify({
-        type: 'claude-error',
-        error: data.toString()
-      }));
-    });
-    
-    // Handle process completion
-    claudeProcess.on('close', async (code) => {
-      console.log(`Claude CLI process exited with code ${code}`);
-      
-      // Clean up process reference
-      const finalSessionId = capturedSessionId || sessionId || processKey;
-      activeClaudeProcesses.delete(finalSessionId);
-      
-      ws.send(JSON.stringify({
-        type: 'claude-complete',
-        exitCode: code,
-        isNewSession: !sessionId && !!command // Flag to indicate this was a new session
-      }));
-      
-      // Clean up temporary image files if any
-      if (claudeProcess.tempImagePaths && claudeProcess.tempImagePaths.length > 0) {
-        for (const imagePath of claudeProcess.tempImagePaths) {
-          await fs.unlink(imagePath).catch(err => 
-            console.error(`Failed to delete temp image ${imagePath}:`, err)
-          );
+      ws.send(JSON.stringify({ type: 'claude-error', error: data.toString() }));
+    };
+
+    if (sshConfig) {
+      try {
+        const ssh = new NodeSSH();
+        await ssh.connect(sshConfig);
+
+        if (localImagePaths.length > 0) {
+          await ssh.execCommand(`mkdir -p ${remoteTempDir}`);
+          for (const img of localImagePaths) {
+            await ssh.putFile(img.local, img.remote);
+          }
         }
-        if (claudeProcess.tempDir) {
-          await fs.rm(claudeProcess.tempDir, { recursive: true, force: true }).catch(err => 
-            console.error(`Failed to delete temp directory ${claudeProcess.tempDir}:`, err)
-          );
+
+        activeClaudeProcesses.set(processKey, { type: 'ssh', ssh, channel: null });
+
+        const result = await ssh.exec('claude', args, {
+          cwd: workingDir,
+          stream: 'both',
+          onChannel: (channel) => {
+            const info = activeClaudeProcesses.get(processKey);
+            if (info) info.channel = channel;
+          },
+          onStdout: handleStdout,
+          onStderr: handleStderr,
+        });
+
+        const finalSessionId = capturedSessionId || sessionId || processKey;
+        activeClaudeProcesses.delete(finalSessionId);
+
+        ws.send(JSON.stringify({
+          type: 'claude-complete',
+          exitCode: result.code,
+          isNewSession: !sessionId && !!command
+        }));
+
+        if (localImagePaths.length > 0) {
+          for (const img of localImagePaths) {
+            await fs.unlink(img.local).catch(err => console.error(`Failed to delete temp image ${img.local}:`, err));
+          }
+          if (tempDir) {
+            await fs.rm(tempDir, { recursive: true, force: true }).catch(err => console.error(`Failed to delete temp dir ${tempDir}:`, err));
+          }
+          if (remoteTempDir) {
+            await ssh.execCommand(`rm -rf ${remoteTempDir}`).catch(err => console.error(`Failed to delete remote temp dir ${remoteTempDir}:`, err.message));
+          }
         }
+
+        ssh.dispose();
+        if (result.code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Claude CLI exited with code ${result.code}`));
+        }
+      } catch (error) {
+        console.error('Claude CLI process error:', error);
+        activeClaudeProcesses.delete(processKey);
+        ws.send(JSON.stringify({ type: 'claude-error', error: error.message }));
+        reject(error);
       }
-      
-      if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(`Claude CLI exited with code ${code}`));
-      }
-    });
-    
-    // Handle process errors
-    claudeProcess.on('error', (error) => {
-      console.error('Claude CLI process error:', error);
-      
-      // Clean up process reference on error
-      const finalSessionId = capturedSessionId || sessionId || processKey;
-      activeClaudeProcesses.delete(finalSessionId);
-      
-      ws.send(JSON.stringify({
-        type: 'claude-error',
-        error: error.message
-      }));
-      
-      reject(error);
-    });
-    
-    // Handle stdin for interactive mode
-    if (command) {
-      // For --print mode with arguments, we don't need to write to stdin
-      claudeProcess.stdin.end();
     } else {
-      // For interactive mode, we need to write the command to stdin if provided later
-      // Keep stdin open for interactive session
-      if (command !== undefined) {
-        claudeProcess.stdin.write(command + '\n');
+      const claudeProcess = spawnFunction('claude', args, {
+        cwd: workingDir,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env }
+      });
+
+      claudeProcess.tempImagePaths = tempImagePaths;
+      claudeProcess.tempDir = tempDir;
+      activeClaudeProcesses.set(processKey, { type: 'local', process: claudeProcess });
+
+      claudeProcess.stdout.on('data', handleStdout);
+      claudeProcess.stderr.on('data', handleStderr);
+
+      claudeProcess.on('close', async (code) => {
+        console.log(`Claude CLI process exited with code ${code}`);
+        const finalSessionId = capturedSessionId || sessionId || processKey;
+        activeClaudeProcesses.delete(finalSessionId);
+        ws.send(JSON.stringify({
+          type: 'claude-complete',
+          exitCode: code,
+          isNewSession: !sessionId && !!command
+        }));
+
+        if (claudeProcess.tempImagePaths && claudeProcess.tempImagePaths.length > 0) {
+          for (const imagePath of claudeProcess.tempImagePaths) {
+            await fs.unlink(imagePath).catch(err => console.error(`Failed to delete temp image ${imagePath}:`, err));
+          }
+          if (claudeProcess.tempDir) {
+            await fs.rm(claudeProcess.tempDir, { recursive: true, force: true }).catch(err => console.error(`Failed to delete temp directory ${claudeProcess.tempDir}:`, err));
+          }
+        }
+
+        if (code === 0) {
+          resolve();
+        } else {
+          reject(new Error(`Claude CLI exited with code ${code}`));
+        }
+      });
+
+      claudeProcess.on('error', (error) => {
+        console.error('Claude CLI process error:', error);
+        const finalSessionId = capturedSessionId || sessionId || processKey;
+        activeClaudeProcesses.delete(finalSessionId);
+        ws.send(JSON.stringify({ type: 'claude-error', error: error.message }));
+        reject(error);
+      });
+
+      if (command) {
         claudeProcess.stdin.end();
+      } else {
+        if (command !== undefined) {
+          claudeProcess.stdin.write(command + '\n');
+          claudeProcess.stdin.end();
+        }
       }
-      // If no command provided, stdin stays open for interactive use
     }
   });
 }
 
 function abortClaudeSession(sessionId) {
-  const process = activeClaudeProcesses.get(sessionId);
-  if (process) {
+  const entry = activeClaudeProcesses.get(sessionId);
+  if (entry) {
     console.log(`🛑 Aborting Claude session: ${sessionId}`);
-    process.kill('SIGTERM');
+    try {
+      if (entry.type === 'ssh' && entry.channel) {
+        entry.channel.signal('TERM');
+        entry.ssh.dispose();
+      } else if (entry.type === 'local' && entry.process) {
+        entry.process.kill('SIGTERM');
+      }
+    } catch (err) {
+      console.error('Error aborting session:', err);
+    }
     activeClaudeProcesses.delete(sessionId);
     return true;
   }
