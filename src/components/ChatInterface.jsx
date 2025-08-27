@@ -1183,6 +1183,19 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
   const [isLoadingSessionMessages, setIsLoadingSessionMessages] = useState(false);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
   const [messagesOffset, setMessagesOffset] = useState(0);
+
+  const sshConfig = useMemo(() => {
+    const host = import.meta.env.VITE_SSH_HOST;
+    if (!host) return null;
+    const cfg = {
+      host,
+      username: import.meta.env.VITE_SSH_USER
+    };
+    if (import.meta.env.VITE_SSH_PORT) cfg.port = parseInt(import.meta.env.VITE_SSH_PORT);
+    if (import.meta.env.VITE_SSH_PASSWORD) cfg.password = import.meta.env.VITE_SSH_PASSWORD;
+    if (import.meta.env.VITE_SSH_PRIVATE_KEY) cfg.privateKey = import.meta.env.VITE_SSH_PRIVATE_KEY;
+    return cfg;
+  }, []);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [totalMessages, setTotalMessages] = useState(0);
   const MESSAGES_PER_PAGE = 20;
@@ -2777,18 +2790,22 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
       });
     } else {
       // Send Claude command (existing code)
+      const claudeOptions = {
+        projectPath: selectedProject.path,
+        cwd: selectedProject.fullPath,
+        sessionId: currentSessionId,
+        resume: !!currentSessionId,
+        toolsSettings: toolsSettings,
+        permissionMode: permissionMode,
+        images: uploadedImages
+      };
+      if (sshConfig) {
+        claudeOptions.ssh = sshConfig;
+      }
       sendMessage({
         type: 'claude-command',
         command: input,
-        options: {
-          projectPath: selectedProject.path,
-          cwd: selectedProject.fullPath,
-          sessionId: currentSessionId,
-          resume: !!currentSessionId,
-          toolsSettings: toolsSettings,
-          permissionMode: permissionMode,
-          images: uploadedImages // Pass images to backend
-        }
+        options: claudeOptions
       });
     }
 
